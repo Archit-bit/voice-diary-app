@@ -1,0 +1,198 @@
+// app/api/process/route.ts
+import { NextRequest, NextResponse } from "next/server";
+import { createClient } from "@supabase/supabase-js";
+
+export const runtime = "nodejs"; // Ensure Node runtime (we need Buffers/SDKs)
+
+/** Helper: get today's date string in IST (Asia/Kolkata) like "2025-08-13" */
+function todayInIST(): string {
+  const now = new Date();
+  const istOffsetMin = 330; // +05:30
+  const utc = now.getTime() + now.getTimezoneOffset() * 60000;
+  const ist = new Date(utc + istOffsetMin * 60000);
+  return ist.toISOString().slice(0, 10);
+}
+
+/** 1) Send audio bytes to Deepgram for transcription */
+async function transcribeWithDeepgram(bytes: Buffer, contentType: string) {
+  const res = await fetch(
+    "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true",
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Token ${process.env.DEEPGRAM_API_KEY!}`,
+        "Content-Type": contentType || "application/octet-stream",
+      },
+      body: bytes,
+    }
+  );
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`Deepgram failed: ${t}`);
+  }
+  const j = await res.json();
+  const transcript =
+    j?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim() ?? "";
+  return transcript;
+}
+
+/** JSON schema we want the LLM to output */
+const extractionSchema = {
+  type: "object",
+  properties: {
+    schema_version: { type: "number" },
+    sleep_hours: { type: "number" },
+    mood: { type: "string" },
+    energy: { type: "number" },
+    focus: { type: "number" },
+    highlights: { type: "array", items: { type: "string" } },
+    challenges: { type: "array", items: { type: "string" } },
+    gratitude: { type: "array", items: { type: "string" } },
+    habits: {
+      type: "object",
+      additionalProperties: { type: ["boolean", "number", "string"] },
+    },
+    work: {
+      type: "object",
+      properties: {
+        top_task_done: { type: "string" },
+        time_blocks: {
+          type: "array",
+          items: {
+            type: "object",
+            properties: {
+              label: { type: "string" },
+              minutes: { type: "number" },
+            },
+          },
+        },
+      },
+    },
+    health: {
+      type: "object",
+      properties: {
+        steps: { type: "number" },
+        water_glasses: { type: "number" },
+        calories: { type: "number" },
+      },
+    },
+    notes: { type: "string" },
+    todos_tomorrow: { type: "array", items: { type: "string" } },
+  },
+  required: ["schema_version"],
+  additionalProperties: true,
+};
+
+/** 2) Send transcript to OpenAI for structured JSON extraction */
+async function extractWithOpenAI(transcript: string) {
+  const res = await fetch("https://api.openai.com/v1/responses", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${process.env.OPENAI_API_KEY!}`,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify({
+      model: "gpt-4o-mini",
+      input: [
+        {
+          role: "system",
+          content:
+            "You extract structured daily journal data. Return ONLY JSON conforming to the provided JSON schema.",
+        },
+        {
+          role: "user",
+          content: `Schema: ${JSON.stringify(
+            extractionSchema
+          )}\n\nRules:\n- Infer numbers from phrases (e.g., 'about seven and a half hours' → 7.5)\n- Omit fields not mentioned\n- mood: single lowercase word when possible\n- notes: 1–3 short sentences\n\nTranscript:\n${transcript}`,
+        },
+      ],
+      response_format: {
+        type: "json_schema",
+        json_schema: { name: "daily_log", schema: extractionSchema },
+      },
+    }),
+  });
+
+  if (!res.ok) {
+    const t = await res.text();
+    throw new Error(`OpenAI failed: ${t}`);
+  }
+  const j = await res.json();
+
+  // Responses API: prefer output[0].content[0].text if present, otherwise output_text
+  const jsonText =
+    j?.output?.[0]?.content?.[0]?.type === "output_text"
+      ? j.output[0].content[0].text
+      : typeof j.output_text === "string"
+      ? j.output_text
+      : "";
+  const parsed = jsonText ? JSON.parse(jsonText) : {};
+  if (!parsed.schema_version) parsed.schema_version = 1;
+  return parsed;
+}
+
+/** 3) Save to Supabase (upsert by user_id + log_date) */
+async function upsertDailyLog({
+  userId,
+  logDate,
+  transcript,
+  extracted,
+}: {
+  userId: string;
+  logDate: string;
+  transcript: string;
+  extracted: any;
+}) {
+  const supabase = createClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.SUPABASE_SERVICE_ROLE!
+  );
+
+  const { data, error } = await supabase
+    .from("daily_logs")
+    .upsert(
+      { user_id: userId, log_date: logDate, transcript, extracted },
+      { onConflict: "user_id,log_date" }
+    )
+    .select()
+    .single();
+
+  if (error) throw error;
+  return data;
+}
+
+export async function POST(req: NextRequest) {
+  try {
+    // Receive multipart/form-data from the browser
+    const form = await req.formData();
+    const file = form.get("audio") as File | null;
+    let logDate = (form.get("log_date") as string) || todayInIST();
+    const userId =
+      (form.get("user_id") as string) || process.env.DEFAULT_USER_ID!;
+
+    if (!file) {
+      return NextResponse.json({ error: "audio missing" }, { status: 400 });
+    }
+
+    const arrayBuffer = await file.arrayBuffer();
+    const bytes = Buffer.from(arrayBuffer);
+
+    // Some browsers will set "audio/webm"; leave as-is; Deepgram accepts webm/opus or wav
+    const contentType = file.type || "application/octet-stream";
+
+    const transcript = await transcribeWithDeepgram(bytes, contentType);
+    const extracted = await extractWithOpenAI(transcript);
+    const row = await upsertDailyLog({
+      userId,
+      logDate,
+      transcript,
+      extracted,
+    });
+
+    return NextResponse.json({ transcript, extracted, row });
+  } catch (e: any) {
+    // Basic server-side logging (appears in your dev terminal / Vercel logs)
+    console.error("[/api/process] ERROR:", e);
+    return NextResponse.json({ error: e.message ?? "failed" }, { status: 500 });
+  }
+}
