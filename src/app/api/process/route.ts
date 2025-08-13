@@ -14,16 +14,22 @@ function todayInIST(): string {
 }
 
 /** 1) Send audio bytes to Deepgram for transcription */
-async function transcribeWithDeepgram(bytes: Buffer, contentType: string) {
+async function transcribeWithDeepgram(bytes: ArrayBuffer, contentType: string) {
+  const body = new Blob([bytes], {
+    type: contentType || "application/octet-stream",
+  });
+
   const res = await fetch(
     "https://api.deepgram.com/v1/listen?model=nova-2&smart_format=true",
     {
       method: "POST",
       headers: {
         Authorization: `Token ${process.env.DEEPGRAM_API_KEY!}`,
-        "Content-Type": contentType || "application/octet-stream",
+        // Do NOT set Content-Type yourself when sending a Blob unless you’re sure.
+        // Here we are sure, so it’s okay to set it to the file’s MIME:
+        "Content-Type": body.type || "application/octet-stream",
       },
-      body: bytes,
+      body, // Blob is valid BodyInit
     }
   );
   if (!res.ok) {
@@ -180,7 +186,7 @@ export async function POST(req: NextRequest) {
     // Some browsers will set "audio/webm"; leave as-is; Deepgram accepts webm/opus or wav
     const contentType = file.type || "application/octet-stream";
 
-    const transcript = await transcribeWithDeepgram(bytes, contentType);
+    const transcript = await transcribeWithDeepgram(arrayBuffer, contentType);
     const extracted = await extractWithOpenAI(transcript);
     const row = await upsertDailyLog({
       userId,
