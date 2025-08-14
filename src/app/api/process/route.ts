@@ -43,8 +43,10 @@ async function transcribeWithDeepgram(bytes: ArrayBuffer, contentType: string) {
 }
 
 /** JSON schema we want the LLM to output */
+// Looser, iteration-friendly schema
 const extractionSchema = {
   type: "object",
+  additionalProperties: false,
   properties: {
     schema_version: { type: "number" },
     sleep_hours: { type: "number" },
@@ -54,40 +56,70 @@ const extractionSchema = {
     highlights: { type: "array", items: { type: "string" } },
     challenges: { type: "array", items: { type: "string" } },
     gratitude: { type: "array", items: { type: "string" } },
+
     habits: {
       type: "object",
-      additionalProperties: { type: ["boolean", "number", "string"] },
+      additionalProperties: false,
+      properties: {
+        yoga: { type: "boolean" },
+        workout: { type: "boolean" },
+        reading_minutes: { type: "number" },
+        no_smoking: { type: "boolean" },
+      },
+      required: ["yoga", "workout", "reading_minutes", "no_smoking"],
     },
+
     work: {
       type: "object",
+      additionalProperties: false,
       properties: {
         top_task_done: { type: "string" },
         time_blocks: {
           type: "array",
           items: {
             type: "object",
+            additionalProperties: false,
             properties: {
               label: { type: "string" },
               minutes: { type: "number" },
             },
+            required: ["label", "minutes"],
           },
         },
       },
+      required: ["top_task_done", "time_blocks"],
     },
+
     health: {
       type: "object",
+      additionalProperties: false,
       properties: {
         steps: { type: "number" },
         water_glasses: { type: "number" },
         calories: { type: "number" },
       },
+      required: ["steps", "water_glasses", "calories"],
     },
+
     notes: { type: "string" },
     todos_tomorrow: { type: "array", items: { type: "string" } },
   },
-  required: ["schema_version"],
-  additionalProperties: true,
-};
+  required: [
+    "schema_version",
+    "sleep_hours",
+    "mood",
+    "energy",
+    "focus",
+    "highlights",
+    "challenges",
+    "gratitude",
+    "habits",
+    "work",
+    "health",
+    "notes",
+    "todos_tomorrow",
+  ],
+} as const;
 
 /** 2) Send transcript to OpenAI for structured JSON extraction */
 async function extractWithOpenAI(transcript: string) {
@@ -103,18 +135,28 @@ async function extractWithOpenAI(transcript: string) {
         {
           role: "system",
           content:
-            "You extract structured daily journal data. Return ONLY JSON conforming to the provided JSON schema.",
+            "You extract structured daily journal data. Return ONLY JSON that conforms to the provided JSON schema.",
         },
         {
           role: "user",
-          content: `Schema: ${JSON.stringify(
-            extractionSchema
-          )}\n\nRules:\n- Infer numbers from phrases (e.g., 'about seven and a half hours' → 7.5)\n- Omit fields not mentioned\n- mood: single lowercase word when possible\n- notes: 1–3 short sentences\n\nTranscript:\n${transcript}`,
+          content:
+            `Schema: ${JSON.stringify(extractionSchema)}\n\n` +
+            "Rules:\n" +
+            "- Infer numbers from phrases (e.g., 'about seven and a half hours' → 7.5)\n" +
+            "- Omit fields not mentioned\n" +
+            "- mood: single lowercase word when possible\n" +
+            "- notes: 1–3 short sentences\n\n" +
+            `Transcript:\n${transcript}`,
         },
       ],
-      response_format: {
-        type: "json_schema",
-        json_schema: { name: "daily_log", schema: extractionSchema },
+      // ✅ Correct formatter shape for Responses API
+      text: {
+        format: {
+          type: "json_schema",
+          name: "daily_log",
+          schema: extractionSchema, // <-- schema lives directly here
+          strict: true,
+        },
       },
     }),
   });
@@ -123,15 +165,19 @@ async function extractWithOpenAI(transcript: string) {
     const t = await res.text();
     throw new Error(`OpenAI failed: ${t}`);
   }
+
   const j = await res.json();
 
-  // Responses API: prefer output[0].content[0].text if present, otherwise output_text
+  // Pull the JSON string from the Responses output (covers common shapes)
+  const fromOutputArray =
+    Array.isArray(j?.output) &&
+    Array.isArray(j.output[0]?.content) &&
+    j.output[0].content.find((c: any) => c?.type === "output_text")?.text;
+
   const jsonText =
-    j?.output?.[0]?.content?.[0]?.type === "output_text"
-      ? j.output[0].content[0].text
-      : typeof j.output_text === "string"
-      ? j.output_text
-      : "";
+    fromOutputArray ??
+    (typeof j?.output_text === "string" ? j.output_text : "");
+
   const parsed = jsonText ? JSON.parse(jsonText) : {};
   if (!parsed.schema_version) parsed.schema_version = 1;
   return parsed;
@@ -181,7 +227,6 @@ export async function POST(req: NextRequest) {
     }
 
     const arrayBuffer = await file.arrayBuffer();
-    const bytes = Buffer.from(arrayBuffer);
 
     // Some browsers will set "audio/webm"; leave as-is; Deepgram accepts webm/opus or wav
     const contentType = file.type || "application/octet-stream";
