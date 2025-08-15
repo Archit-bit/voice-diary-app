@@ -4,17 +4,66 @@ import React, { useEffect, useRef, useState } from "react";
 import { supabase } from "@/lib/supabase-browser";
 import type { Session } from "@supabase/supabase-js";
 
-/** Compute today in IST as YYYY-MM-DD */
+/** IST yyyy-mm-dd */
 function todayInIST(): string {
   const now = new Date();
-  const istOffsetMin = 330; // +05:30
+  const istOffsetMin = 330;
   const utcMs = now.getTime() + now.getTimezoneOffset() * 60000;
   const ist = new Date(utcMs + istOffsetMin * 60000);
   return ist.toISOString().slice(0, 10);
 }
 
+type Extracted = {
+  schema_version?: number;
+  sleep_hours?: number;
+  mood?: string;
+  energy?: number;
+  focus?: number;
+  highlights?: string[];
+  challenges?: string[];
+  gratitude?: string[];
+  habits?: {
+    yoga?: boolean;
+    workout?: boolean;
+    reading_minutes?: number;
+    no_smoking?: boolean;
+  };
+  work?: {
+    top_task_done?: string;
+    time_blocks?: { label: string; minutes: number }[];
+  };
+  health?: {
+    steps?: number;
+    water_glasses?: number;
+    calories?: number;
+  };
+  notes?: string;
+  todos_tomorrow?: string[];
+};
+function PromptChips() {
+  const prompts = [
+    "One win today…",
+    "One challenge…",
+    "Mood (one word) & energy (1–10)…",
+    "Anything you’re grateful for…",
+    "What to do first tomorrow…",
+  ];
+  return (
+    <div className="mb-3 flex flex-wrap gap-2">
+      {prompts.map((p) => (
+        <span
+          key={p}
+          className="rounded-full bg-neutral-800 px-3 py-1 text-xs text-neutral-200"
+        >
+          {p}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export default function Page() {
-  // ---- Auth state ----
+  // --- Auth
   const [session, setSession] = useState<Session | null>(null);
   const [email, setEmail] = useState("");
 
@@ -28,20 +77,24 @@ export default function Page() {
     return () => sub.subscription.unsubscribe();
   }, []);
 
-  // ---- Recorder state ----
+  // --- Recorder state
   const [logDate, setLogDate] = useState(todayInIST);
   const [recording, setRecording] = useState(false);
   const [busy, setBusy] = useState(false);
-  const [result, setResult] = useState<any>(null);
-  const [chunks, setChunks] = useState<BlobPart[]>([]);
   const [error, setError] = useState<string | null>(null);
+  const [result, setResult] = useState<{
+    transcript?: string;
+    extracted?: Extracted;
+    row?: any;
+  } | null>(null);
+  const [chunks, setChunks] = useState<BlobPart[]>([]);
   const [durationSec, setDurationSec] = useState(0);
   const [mimeType, setMimeType] = useState<string>("");
 
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const timerRef = useRef<number | null>(null);
 
-  // Detect supported audio mime type after mount (browser only)
+  // Pick supported mime type after mount
   useEffect(() => {
     if (typeof window !== "undefined" && (window as any).MediaRecorder) {
       const candidates = [
@@ -56,12 +109,10 @@ export default function Page() {
             setMimeType(mt);
             return;
           }
-        } catch {
-          /* ignore */
-        }
+        } catch {}
       }
     }
-    setMimeType(""); // let browser pick a default if none matched
+    setMimeType("");
   }, []);
 
   async function startRec() {
@@ -81,12 +132,12 @@ export default function Page() {
       mr.ondataavailable = (e) =>
         e.data.size && setChunks((p) => [...p, e.data]);
       mr.onstop = () => {
-        stream.getTracks().forEach((t) => t.stop()); // release mic
+        stream.getTracks().forEach((t) => t.stop());
         if (timerRef.current) window.clearInterval(timerRef.current);
         timerRef.current = null;
       };
 
-      mr.start(1000); // emit chunk every second
+      mr.start(1000);
       mediaRecorderRef.current = mr;
       setRecording(true);
       timerRef.current = window.setInterval(
@@ -113,27 +164,21 @@ export default function Page() {
       setError("Please sign in first.");
       return;
     }
-
     setBusy(true);
     setError(null);
     try {
-      const contentType = mimeType || "audio/webm";
-      const blob = new Blob(chunks, { type: contentType });
+      const ct = mimeType || "audio/webm";
+      const blob = new Blob(chunks, { type: ct });
 
       const fd = new FormData();
-      fd.append(
-        "audio",
-        blob,
-        contentType.includes("ogg") ? "entry.ogg" : "entry.webm"
-      );
+      fd.append("audio", blob, ct.includes("ogg") ? "entry.ogg" : "entry.webm");
       fd.append("log_date", logDate);
 
       const res = await fetch("/api/process", {
         method: "POST",
         body: fd,
-        headers: { Authorization: `Bearer ${session.access_token}` }, // pass JWT
+        headers: { Authorization: `Bearer ${session.access_token}` },
       });
-
       const json = await res.json();
       if (!res.ok) setError(json?.error || "Server error");
       else setResult(json);
@@ -144,49 +189,32 @@ export default function Page() {
     }
   }
 
+  // --- Friendly editor helpers (controlled form bound to result.extracted)
+  const extracted = result?.extracted ?? {};
+  function setExtracted(next: Extracted) {
+    setResult((r) => ({ ...(r ?? {}), extracted: next }));
+  }
+
   const minutes = Math.floor(durationSec / 60);
   const seconds = durationSec % 60;
 
   return (
-    <main
-      style={{
-        minHeight: "100vh",
-        background: "#0b0b0c",
-        color: "#e5e7eb",
-        padding: 24,
-      }}
-    >
-      <div style={{ maxWidth: 760, margin: "0 auto" }}>
-        {/* --- Auth strip --- */}
+    <main className="min-h-screen p-6">
+      <div className="mx-auto max-w-3xl">
+        {/* Auth strip */}
         {!session ? (
-          <div
-            style={{
-              marginBottom: 16,
-              padding: 12,
-              borderRadius: 8,
-              background: "#111827",
-              border: "1px solid #1f2937",
-            }}
-          >
-            <div style={{ fontWeight: 600, marginBottom: 8 }}>
-              Sign in to save your logs
-            </div>
-            <div style={{ display: "flex", gap: 8 }}>
+          <div className="mb-4 rounded-lg border border-neutral-800 bg-neutral-900 p-3">
+            <div className="mb-2 font-semibold">Sign in to save your logs</div>
+            <div className="flex gap-2">
               <input
+                className="flex-1 rounded-md border border-neutral-800 bg-neutral-950 px-3 py-2 text-neutral-100"
                 type="email"
                 placeholder="you@example.com"
                 value={email}
                 onChange={(e) => setEmail(e.target.value)}
-                style={{
-                  flex: 1,
-                  background: "#0b1220",
-                  border: "1px solid #1f2937",
-                  borderRadius: 8,
-                  padding: "6px 8px",
-                  color: "#e5e7eb",
-                }}
               />
               <button
+                className="rounded-md bg-indigo-600 px-3 py-2 text-white hover:bg-indigo-500"
                 onClick={async () => {
                   const { error } = await supabase.auth.signInWithOtp({
                     email,
@@ -195,132 +223,80 @@ export default function Page() {
                   if (error) alert(error.message);
                   else alert("Magic link sent! Check your email.");
                 }}
-                style={{
-                  padding: "8px 12px",
-                  borderRadius: 8,
-                  background: "#4f46e5",
-                  border: 0,
-                  color: "white",
-                }}
               >
                 Send magic link
               </button>
             </div>
           </div>
         ) : (
-          <div
-            style={{
-              marginBottom: 16,
-              display: "flex",
-              gap: 12,
-              alignItems: "center",
-            }}
-          >
-            <span style={{ fontSize: 12, color: "#9ca3af" }}>
-              Signed in as <code>{session.user.email}</code>
+          <div className="mb-4 flex items-center gap-3 text-sm text-neutral-400">
+            <span>
+              Signed in as{" "}
+              <code className="text-neutral-200">{session.user.email}</code>
             </span>
             <button
+              className="rounded-md bg-neutral-700 px-2 py-1 text-white hover:bg-neutral-600"
               onClick={() => supabase.auth.signOut()}
-              style={{
-                padding: "6px 10px",
-                borderRadius: 8,
-                background: "#374151",
-                border: 0,
-                color: "white",
-              }}
             >
               Sign out
             </button>
           </div>
         )}
 
-        {/* --- Always render the recorder UI below (don’t gate it behind session) --- */}
-        <h1 style={{ fontSize: 28, fontWeight: 700, marginBottom: 6 }}>
-          🎙️ Voice Diary
-        </h1>
-        <p style={{ color: "#9ca3af", marginBottom: 16 }}>
+        <h1 className="mb-1 text-3xl font-semibold">🎙️ Voice Diary</h1>
+        <p className="mb-4 text-neutral-400">
           Speak freely — we’ll transcribe, extract key details, and save to your
           daily log.
         </p>
 
-        <div
-          style={{
-            display: "flex",
-            gap: 12,
-            alignItems: "center",
-            marginBottom: 16,
-          }}
-        >
-          <label style={{ fontSize: 14 }}>
+        <div className="mb-4 flex items-center gap-4">
+          <label className="text-sm">
             Log date (IST):{" "}
             <input
+              className="ml-2 rounded-md border border-neutral-800 bg-neutral-900 px-2 py-1 text-neutral-100"
               type="date"
               value={logDate}
               onChange={(e) => setLogDate(e.target.value)}
-              style={{
-                background: "#111827",
-                border: "1px solid #1f2937",
-                borderRadius: 8,
-                padding: "6px 8px",
-                color: "#e5e7eb",
-                marginLeft: 8,
-              }}
             />
           </label>
-          <span style={{ fontSize: 12, color: "#a1a1aa" }}>
+          <span className="text-xs text-neutral-400">
             Recording format:{" "}
-            <code style={{ color: "#c084fc" }}>{mimeType || "auto"}</code>
+            <code className="text-fuchsia-300">{mimeType || "auto"}</code>
           </span>
         </div>
 
-        <div style={{ display: "flex", gap: 12, marginBottom: 16 }}>
+        <div className="mb-4 flex items-center gap-3">
           {!recording ? (
             <button
               onClick={startRec}
-              style={{
-                padding: "10px 16px",
-                borderRadius: 12,
-                background: "#4f46e5",
-                border: 0,
-                color: "white",
-              }}
+              className="rounded-xl bg-indigo-600 px-4 py-2 text-white hover:bg-indigo-500"
             >
               Start Recording
             </button>
           ) : (
             <button
               onClick={stopRec}
-              style={{
-                padding: "10px 16px",
-                borderRadius: 12,
-                background: "#dc2626",
-                border: 0,
-                color: "white",
-              }}
+              className="rounded-xl bg-rose-600 px-4 py-2 text-white hover:bg-rose-500"
             >
               Stop
             </button>
           )}
+          {recording && <PromptChips />}
+
           <button
             onClick={processAndSave}
             disabled={!chunks.length || busy || !session}
             title={!session ? "Sign in to save" : undefined}
-            style={{
-              padding: "10px 16px",
-              borderRadius: 12,
-              background:
-                !chunks.length || busy || !session ? "#064e3b" : "#059669",
-              opacity: !chunks.length || busy || !session ? 0.6 : 1,
-              border: 0,
-              color: "white",
-              cursor:
-                !chunks.length || busy || !session ? "not-allowed" : "pointer",
-            }}
+            className={`rounded-xl px-4 py-2 text-white ${
+              !chunks.length || busy || !session
+                ? "cursor-not-allowed bg-emerald-800/70"
+                : "bg-emerald-600 hover:bg-emerald-500"
+            }`}
           >
             {busy ? "Processing..." : "Process & Save"}
           </button>
 
-          <span style={{ fontSize: 14, color: "#a1a1aa", marginLeft: 8 }}>
+          <span className="ml-2 text-sm text-neutral-400">
             {recording
               ? `⏺️ ${minutes}:${seconds.toString().padStart(2, "0")}`
               : chunks.length
@@ -330,73 +306,355 @@ export default function Page() {
         </div>
 
         {error && (
-          <div
-            style={{
-              marginBottom: 16,
-              padding: 12,
-              borderRadius: 8,
-              background: "#3f1d1d",
-              border: "1px solid #7f1d1d",
-            }}
-          >
+          <div className="mb-4 rounded-md border border-rose-700 bg-rose-900/40 p-3">
             <strong>Error:</strong> {error}
           </div>
         )}
 
+        {/* Transcript */}
         {result?.transcript && (
-          <section style={{ marginBottom: 24 }}>
-            <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>
-              Transcript
-            </h2>
-            <p
-              style={{
-                padding: 12,
-                borderRadius: 8,
-                background: "#111827",
-                border: "1px solid #1f2937",
-                lineHeight: 1.6,
-              }}
-            >
+          <section className="mb-6">
+            <h2 className="mb-2 text-xl font-semibold">Transcript</h2>
+            <p className="leading-relaxed rounded-md border border-neutral-800 bg-neutral-900 p-3">
               {result.transcript}
             </p>
           </section>
         )}
 
+        {/* Raw JSON (optional while developing) */}
         {result?.extracted && (
-          <section style={{ marginBottom: 24 }}>
-            <h2 style={{ fontSize: 20, fontWeight: 600, marginBottom: 8 }}>
-              Extracted JSON
-            </h2>
+          <section className="mb-6">
+            <h2 className="mb-2 text-xl font-semibold">Extracted JSON</h2>
             <textarea
               defaultValue={JSON.stringify(result.extracted, null, 2)}
               onChange={(e) => {
                 try {
-                  const next = JSON.parse(e.target.value || "{}");
-                  setResult((r: any) => ({ ...r, extracted: next }));
-                } catch {
-                  /* ignore */
-                }
+                  setExtracted(JSON.parse(e.target.value || "{}"));
+                } catch {}
               }}
-              style={{
-                width: "100%",
-                height: 320,
-                padding: 12,
-                borderRadius: 8,
-                background: "#111827",
-                border: "1px solid #1f2937",
-                color: "#d1d5db",
-                fontFamily:
-                  "ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, 'Liberation Mono', 'Courier New', monospace",
-                fontSize: 13,
-              }}
+              className="h-72 w-full rounded-md border border-neutral-800 bg-neutral-900 p-3 font-mono text-sm text-neutral-200"
             />
-            <p style={{ fontSize: 12, color: "#9ca3af", marginTop: 8 }}>
-              (It’s already saved by the server. We’ll add an edit/save route
-              next.)
+            <p className="mt-2 text-sm text-neutral-400">
+              (Already saved by the server. Edit below and click{" "}
+              <em>Save Changes</em> to update.)
             </p>
           </section>
         )}
+
+        {/* Friendly editor */}
+        {result?.row?.id && (
+          <FriendlyEditor
+            initial={extracted}
+            rowId={result.row.id}
+            token={session?.access_token ?? ""}
+            onSaved={(next) => setExtracted(next)}
+          />
+        )}
       </div>
     </main>
+  );
+}
+
+/* ---------------- Friendly Editor Component ---------------- */
+
+function FriendlyEditor({
+  initial,
+  rowId,
+  token,
+  onSaved,
+}: {
+  initial: Extracted;
+  rowId: string;
+  token: string;
+  onSaved: (next: Extracted) => void;
+}) {
+  const [form, setForm] = useState<Extracted>(() => ({
+    schema_version: 1,
+    highlights: [],
+    challenges: [],
+    gratitude: [],
+    habits: {
+      yoga: false,
+      workout: false,
+      reading_minutes: 0,
+      no_smoking: false,
+    },
+    work: { top_task_done: "", time_blocks: [] },
+    health: { steps: 0, water_glasses: 0, calories: 0 },
+    todos_tomorrow: [],
+    ...initial,
+  }));
+  const [saving, setSaving] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+
+  // helpers for list <-> textarea
+  const listToText = (xs?: string[]) => (xs ?? []).join("\n");
+  const textToList = (t: string) =>
+    t
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+
+  async function save() {
+    setSaving(true);
+    setMsg(null);
+    try {
+      const res = await fetch(`/api/logs/${rowId}`, {
+        method: "PATCH",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+        body: JSON.stringify({ extracted: form }),
+      });
+      const json = await res.json();
+      if (!res.ok) throw new Error(json?.error || "Save failed");
+      setMsg("Saved!");
+      onSaved(form);
+    } catch (e: any) {
+      setMsg(e.message || "Save failed");
+    } finally {
+      setSaving(false);
+      setTimeout(() => setMsg(null), 2000);
+    }
+  }
+
+  return (
+    <section className="mb-16">
+      <h2 className="mb-3 text-xl font-semibold">Edit fields</h2>
+
+      <div className="grid gap-4 md:grid-cols-2">
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3">
+          <label className="block text-sm text-neutral-300">Sleep hours</label>
+          <input
+            type="number"
+            step="0.5"
+            min={0}
+            max={24}
+            value={form.sleep_hours ?? 0}
+            onChange={(e) =>
+              setForm({ ...form, sleep_hours: Number(e.target.value) })
+            }
+            className="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1"
+          />
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3">
+          <label className="block text-sm text-neutral-300">Mood</label>
+          <div className="mt-1 flex flex-wrap gap-2">
+            {["great", "good", "neutral", "low", "stressed"].map((m) => (
+              <button
+                key={m}
+                onClick={() => setForm({ ...form, mood: m })}
+                className={`rounded-full px-3 py-1 text-sm ${
+                  form.mood === m
+                    ? "bg-indigo-600 text-white"
+                    : "bg-neutral-800 text-neutral-200 hover:bg-neutral-700"
+                }`}
+              >
+                {m}
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3">
+          <label className="block text-sm text-neutral-300">
+            Energy: {form.energy ?? 0}
+          </label>
+          <input
+            type="range"
+            min={0}
+            max={10}
+            value={form.energy ?? 0}
+            onChange={(e) =>
+              setForm({ ...form, energy: Number(e.target.value) })
+            }
+            className="mt-2 w-full"
+          />
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3">
+          <label className="block text-sm text-neutral-300">
+            Focus: {form.focus ?? 0}
+          </label>
+          <input
+            type="range"
+            min={0}
+            max={10}
+            value={form.focus ?? 0}
+            onChange={(e) =>
+              setForm({ ...form, focus: Number(e.target.value) })
+            }
+            className="mt-2 w-full"
+          />
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 md:col-span-2">
+          <label className="block text-sm text-neutral-300">
+            Highlights (one per line)
+          </label>
+          <textarea
+            className="mt-1 h-28 w-full rounded-md border border-neutral-800 bg-neutral-950 p-2"
+            value={listToText(form.highlights)}
+            onChange={(e) =>
+              setForm({ ...form, highlights: textToList(e.target.value) })
+            }
+          />
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 md:col-span-2">
+          <label className="block text-sm text-neutral-300">
+            Challenges (one per line)
+          </label>
+          <textarea
+            className="mt-1 h-28 w-full rounded-md border border-neutral-800 bg-neutral-950 p-2"
+            value={listToText(form.challenges)}
+            onChange={(e) =>
+              setForm({ ...form, challenges: textToList(e.target.value) })
+            }
+          />
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 md:col-span-2">
+          <label className="block text-sm text-neutral-300">
+            Gratitude (one per line)
+          </label>
+          <textarea
+            className="mt-1 h-28 w-full rounded-md border border-neutral-800 bg-neutral-950 p-2"
+            value={listToText(form.gratitude)}
+            onChange={(e) =>
+              setForm({ ...form, gratitude: textToList(e.target.value) })
+            }
+          />
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3">
+          <div className="mb-2 text-sm text-neutral-300">Habits</div>
+          <div className="space-y-2">
+            {[
+              ["yoga", "Yoga"],
+              ["workout", "Workout"],
+              ["no_smoking", "No smoking"],
+            ].map(([k, label]) => (
+              <label key={k} className="flex items-center gap-2 text-sm">
+                <input
+                  type="checkbox"
+                  checked={Boolean((form.habits as any)?.[k])}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      habits: { ...(form.habits ?? {}), [k]: e.target.checked },
+                    })
+                  }
+                />
+                {label}
+              </label>
+            ))}
+            <label className="block text-sm">
+              Reading minutes
+              <input
+                type="number"
+                min={0}
+                value={form.habits?.reading_minutes ?? 0}
+                onChange={(e) =>
+                  setForm({
+                    ...form,
+                    habits: {
+                      ...(form.habits ?? {}),
+                      reading_minutes: Number(e.target.value),
+                    },
+                  })
+                }
+                className="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1"
+              />
+            </label>
+          </div>
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3">
+          <label className="block text-sm text-neutral-300">
+            Top task done
+          </label>
+          <input
+            className="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1"
+            value={form.work?.top_task_done ?? ""}
+            onChange={(e) =>
+              setForm({
+                ...form,
+                work: { ...(form.work ?? {}), top_task_done: e.target.value },
+              })
+            }
+          />
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3">
+          <label className="block text-sm text-neutral-300">Health</label>
+          <div className="mt-2 grid grid-cols-3 gap-2">
+            {[
+              ["steps", "Steps"],
+              ["water_glasses", "Water"],
+              ["calories", "Calories"],
+            ].map(([k, label]) => (
+              <label key={k} className="text-xs">
+                {label}
+                <input
+                  type="number"
+                  min={0}
+                  value={(form.health as any)?.[k] ?? 0}
+                  onChange={(e) =>
+                    setForm({
+                      ...form,
+                      health: {
+                        ...(form.health ?? {}),
+                        [k]: Number(e.target.value),
+                      },
+                    })
+                  }
+                  className="mt-1 w-full rounded-md border border-neutral-800 bg-neutral-950 px-2 py-1"
+                />
+              </label>
+            ))}
+          </div>
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 md:col-span-2">
+          <label className="block text-sm text-neutral-300">Notes</label>
+          <textarea
+            className="mt-1 h-28 w-full rounded-md border border-neutral-800 bg-neutral-950 p-2"
+            value={form.notes ?? ""}
+            onChange={(e) => setForm({ ...form, notes: e.target.value })}
+          />
+        </div>
+
+        <div className="rounded-md border border-neutral-800 bg-neutral-900 p-3 md:col-span-2">
+          <label className="block text-sm text-neutral-300">
+            Todos tomorrow (one per line)
+          </label>
+          <textarea
+            className="mt-1 h-28 w-full rounded-md border border-neutral-800 bg-neutral-950 p-2"
+            value={listToText(form.todos_tomorrow)}
+            onChange={(e) =>
+              setForm({ ...form, todos_tomorrow: textToList(e.target.value) })
+            }
+          />
+        </div>
+      </div>
+
+      <div className="mt-4 flex items-center gap-3">
+        <button
+          onClick={save}
+          disabled={!token || saving}
+          className={`rounded-md px-4 py-2 text-white ${
+            !token || saving
+              ? "cursor-not-allowed bg-indigo-800/70"
+              : "bg-indigo-600 hover:bg-indigo-500"
+          }`}
+        >
+          {saving ? "Saving..." : "Save Changes"}
+        </button>
+        {msg && <span className="text-sm text-neutral-400">{msg}</span>}
+      </div>
+    </section>
   );
 }
