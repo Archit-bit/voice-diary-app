@@ -2,9 +2,9 @@
 import { NextRequest, NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-export const runtime = "nodejs"; // Ensure Node runtime (we need Buffers/SDKs)
+export const runtime = "nodejs";
 
-/** Helper: get today's date string in IST (Asia/Kolkata) like "2025-08-13" */
+/** IST yyyy-mm-dd */
 function todayInIST(): string {
   const now = new Date();
   const istOffsetMin = 330; // +05:30
@@ -13,7 +13,7 @@ function todayInIST(): string {
   return ist.toISOString().slice(0, 10);
 }
 
-/** 1) Send audio bytes to Deepgram for transcription */
+/** 1) Deepgram STT */
 async function transcribeWithDeepgram(bytes: ArrayBuffer, contentType: string) {
   const body = new Blob([bytes], {
     type: contentType || "application/octet-stream",
@@ -25,25 +25,20 @@ async function transcribeWithDeepgram(bytes: ArrayBuffer, contentType: string) {
       method: "POST",
       headers: {
         Authorization: `Token ${process.env.DEEPGRAM_API_KEY!}`,
-        // Do NOT set Content-Type yourself when sending a Blob unless you’re sure.
-        // Here we are sure, so it’s okay to set it to the file’s MIME:
         "Content-Type": body.type || "application/octet-stream",
       },
-      body, // Blob is valid BodyInit
+      body,
     }
   );
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`Deepgram failed: ${t}`);
-  }
+  if (!res.ok) throw new Error(`Deepgram failed: ${await res.text()}`);
+
   const j = await res.json();
   const transcript =
     j?.results?.channels?.[0]?.alternatives?.[0]?.transcript?.trim() ?? "";
   return transcript;
 }
 
-/** JSON schema we want the LLM to output */
-// Looser, iteration-friendly schema
+/** 2) JSON schema for extraction (strict mode requires additionalProperties:false and required lists) */
 const extractionSchema = {
   type: "object",
   additionalProperties: false,
@@ -56,7 +51,6 @@ const extractionSchema = {
     highlights: { type: "array", items: { type: "string" } },
     challenges: { type: "array", items: { type: "string" } },
     gratitude: { type: "array", items: { type: "string" } },
-
     habits: {
       type: "object",
       additionalProperties: false,
@@ -68,7 +62,6 @@ const extractionSchema = {
       },
       required: ["yoga", "workout", "reading_minutes", "no_smoking"],
     },
-
     work: {
       type: "object",
       additionalProperties: false,
@@ -89,7 +82,6 @@ const extractionSchema = {
       },
       required: ["top_task_done", "time_blocks"],
     },
-
     health: {
       type: "object",
       additionalProperties: false,
@@ -100,7 +92,6 @@ const extractionSchema = {
       },
       required: ["steps", "water_glasses", "calories"],
     },
-
     notes: { type: "string" },
     todos_tomorrow: { type: "array", items: { type: "string" } },
   },
@@ -121,7 +112,7 @@ const extractionSchema = {
   ],
 } as const;
 
-/** 2) Send transcript to OpenAI for structured JSON extraction */
+/** 3) OpenAI extraction via Responses API with json_schema formatter */
 async function extractWithOpenAI(transcript: string) {
   const res = await fetch("https://api.openai.com/v1/responses", {
     method: "POST",
@@ -149,33 +140,24 @@ async function extractWithOpenAI(transcript: string) {
             `Transcript:\n${transcript}`,
         },
       ],
-      // ✅ Correct formatter shape for Responses API
       text: {
         format: {
           type: "json_schema",
           name: "daily_log",
-          schema: extractionSchema, // <-- schema lives directly here
+          schema: extractionSchema,
           strict: true,
         },
       },
     }),
   });
 
-  if (!res.ok) {
-    const t = await res.text();
-    throw new Error(`OpenAI failed: ${t}`);
-  }
-
+  if (!res.ok) throw new Error(`OpenAI failed: ${await res.text()}`);
   const j = await res.json();
 
-  // Pull the JSON string from the Responses output (covers common shapes)
-  const fromOutputArray =
-    Array.isArray(j?.output) &&
-    Array.isArray(j.output[0]?.content) &&
-    j.output[0].content.find((c: any) => c?.type === "output_text")?.text;
-
   const jsonText =
-    fromOutputArray ??
+    (Array.isArray(j?.output) &&
+      Array.isArray(j.output[0]?.content) &&
+      j.output[0].content.find((c: any) => c?.type === "output_text")?.text) ||
     (typeof j?.output_text === "string" ? j.output_text : "");
 
   const parsed = jsonText ? JSON.parse(jsonText) : {};
@@ -183,66 +165,65 @@ async function extractWithOpenAI(transcript: string) {
   return parsed;
 }
 
-/** 3) Save to Supabase (upsert by user_id + log_date) */
-async function upsertDailyLog({
-  userId,
-  logDate,
-  transcript,
-  extracted,
-}: {
-  userId: string;
-  logDate: string;
-  transcript: string;
-  extracted: any;
-}) {
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE!
-  );
-
-  const { data, error } = await supabase
-    .from("daily_logs")
-    .upsert(
-      { user_id: userId, log_date: logDate, transcript, extracted },
-      { onConflict: "user_id,log_date" }
-    )
-    .select()
-    .single();
-
-  if (error) throw error;
-  return data;
-}
-
+/** 4) Main handler */
 export async function POST(req: NextRequest) {
   try {
-    // Receive multipart/form-data from the browser
     const form = await req.formData();
-    const file = form.get("audio") as File | null;
-    let logDate = (form.get("log_date") as string) || todayInIST();
-    const userId =
-      (form.get("user_id") as string) || process.env.DEFAULT_USER_ID!;
 
-    if (!file) {
-      return NextResponse.json({ error: "audio missing" }, { status: 400 });
+    // Validate we actually received a file
+    const filePart = form.get("audio");
+    if (!(filePart instanceof File)) {
+      return NextResponse.json(
+        { error: "audio must be a file upload (Blob/File)" },
+        { status: 400 }
+      );
     }
+    const file = filePart as File;
 
+    const logDate = (form.get("log_date") as string) || todayInIST();
+
+    // Prepare audio for Deepgram
     const arrayBuffer = await file.arrayBuffer();
-
-    // Some browsers will set "audio/webm"; leave as-is; Deepgram accepts webm/opus or wav
     const contentType = file.type || "application/octet-stream";
 
+    // 1) STT
     const transcript = await transcribeWithDeepgram(arrayBuffer, contentType);
-    const extracted = await extractWithOpenAI(transcript);
-    const row = await upsertDailyLog({
-      userId,
-      logDate,
-      transcript,
-      extracted,
-    });
 
-    return NextResponse.json({ transcript, extracted, row });
+    // 2) Extract JSON
+    const extracted = await extractWithOpenAI(transcript);
+
+    // 3) Supabase client with caller's JWT (RLS-friendly)
+    const authHeader = req.headers.get("Authorization") || "";
+    const supabase = createClient(
+      process.env.NEXT_PUBLIC_SUPABASE_URL!,
+      process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+      { global: { headers: { Authorization: authHeader } } }
+    );
+
+    // 4) Get the authenticated user id from JWT
+    const { data: userData, error: userErr } = await supabase.auth.getUser();
+    if (userErr || !userData.user) {
+      return NextResponse.json(
+        { error: "Unauthorized (no session)" },
+        { status: 401 }
+      );
+    }
+    const userId = userData.user.id;
+
+    // 5) Upsert row (RLS policies must allow owner access)
+    const { data, error } = await supabase
+      .from("daily_logs")
+      .upsert(
+        { user_id: userId, log_date: logDate, transcript, extracted },
+        { onConflict: "user_id,log_date" }
+      )
+      .select()
+      .single();
+
+    if (error) throw error;
+
+    return NextResponse.json({ transcript, extracted, row: data });
   } catch (e: any) {
-    // Basic server-side logging (appears in your dev terminal / Vercel logs)
     console.error("[/api/process] ERROR:", e);
     return NextResponse.json({ error: e.message ?? "failed" }, { status: 500 });
   }
