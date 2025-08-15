@@ -1,26 +1,33 @@
-import { NextRequest, NextResponse } from "next/server";
+// src/app/api/logs/[id]/route.ts
+import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
 
-const url = process.env.NEXT_PUBLIC_SUPABASE_URL!;
-const anon = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!;
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+);
 
 export async function PATCH(
-  req: NextRequest,
+  req: Request,
   { params }: { params: { id: string } }
 ) {
-  const body = await req.json();
-  const supabase = createClient(url, anon, {
-    global: {
-      headers: { Authorization: req.headers.get("Authorization") ?? "" },
-    },
-  });
+  try {
+    const { id } = params;
+    const body = (await req.json()) as { extracted?: unknown };
 
-  const { error } = await supabase
-    .from("daily_logs") // 🔁 switched
-    .update({ extracted: body.extracted })
-    .eq("id", params.id);
+    const { data, error } = await supabase
+      .from("daily_logs")
+      .update({ extracted: body.extracted })
+      .eq("id", id)
+      .select()
+      .single();
 
-  if (error)
-    return NextResponse.json({ error: error.message }, { status: 400 });
-  return NextResponse.json({ ok: true });
+    if (error) {
+      return NextResponse.json({ error: error.message }, { status: 400 });
+    }
+    return NextResponse.json({ row: data });
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : "Unknown error";
+    return NextResponse.json({ error: msg }, { status: 500 });
+  }
 }
