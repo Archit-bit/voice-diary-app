@@ -1,20 +1,20 @@
 // src/app/api/logs/[id]/route.ts
 import { NextResponse } from "next/server";
 import { createClient } from "@supabase/supabase-js";
-import type { NextRequest } from "next/server";
 
 const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_URL!,
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-type RouteParams = { id: string };
-type RouteContext = { params: RouteParams };
-
-export async function PATCH(req: NextRequest, context: RouteContext) {
-  const { id } = context.params;
+export async function PATCH(
+  req: Request,
+  { params }: { params: { id: string } }
+) {
+  const { id } = params;
 
   try {
+    // Body is the new extracted JSON
     const body = (await req.json()) as { extracted?: unknown };
 
     const { data, error } = await supabase
