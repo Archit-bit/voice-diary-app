@@ -7,14 +7,10 @@ const supabase = createClient(
   process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
 );
 
-export async function PATCH(
-  req: Request,
-  { params }: { params: { id: string } }
-) {
-  const { id } = params;
+export async function PATCH(req: Request, context: any) {
+  const { id } = (context?.params ?? {}) as { id: string };
 
   try {
-    // Body is the new extracted JSON
     const body = (await req.json()) as { extracted?: unknown };
 
     const { data, error } = await supabase
